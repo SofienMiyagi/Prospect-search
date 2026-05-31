@@ -1,7 +1,6 @@
 // Vercel Serverless Function — /api/search
-// Recherche dans les registres publics + enrichissement email, avec PAGINATION CONTINUE.
-// Le frontend rappelle cette fonction (avec un curseur) jusqu'à atteindre le nombre
-// de prospects AVEC email souhaité. Les prospects sans email sont triés en fin de liste.
+// Registres publics + PAGINATION CONTINUE + découverte de domaine (Google) + scraping site.
+// Priorité email : confirmé (site) > probable (pattern+MX) > estimé > générique (site).
 
 const dns = require("dns").promises;
 
@@ -9,6 +8,11 @@ const NAF_DEFAULT = ["4322B", "2825Z", "4669B", "4329B", "4321A"];
 const SUFFIXES = /\b(sarl|sas|sasu|sa|eurl|sci|snc|group|groupe|holding|france|international|ltd|limited|gmbh|bv|srl|spa|the|co|inc)\b/gi;
 const TIME_BUDGET_MS = 18000;
 const MAX_PAGES_PER_QUERY = 40;
+const ENRICH_CONCURRENCY = 10;
+const EMAIL_SCRAPE_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+const JUNK = ["example.", "sentry", "wixpress", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+  "your-email", "yourname", "yourdomain", "domain.com", "email@", "u003e", "@2x", "name@", "nom@"];
+const SOCIAL = /linkedin|facebook|youtube|wikipedia|societe\.com|verif\.|infogreffe|pappers|google\.|twitter|x\.com|instagram|pagesjaunes|annuaire|indeed|glassdoor|mappy|yelp|tripadvisor/i;
 
 function slug(s) {
   if (!s) return "";
@@ -24,10 +28,7 @@ function guessDomains(company) {
 function emailCandidates(first, last, domain) {
   const f = slug(first), l = slug(last);
   if (!domain || (!f && !l)) return [];
-  const pats = [
-    [`${f}.${l}`, 35], [`${f[0] || ""}${l}`, 18], [f, 12],
-    [`${f}${l}`, 9], [`${f[0] || ""}.${l}`, 7], [l, 5],
-  ];
+  const pats = [[`${f}.${l}`, 35], [`${f[0] || ""}${l}`, 18], [f, 12], [`${f}${l}`, 9], [`${f[0] || ""}.${l}`, 7], [l, 5]];
   const seen = new Set(), out = [];
   for (const [local, w] of pats) {
     if (!local || local.includes("undefined") || local.startsWith(".") || local.endsWith(".")) continue;
@@ -38,15 +39,82 @@ function emailCandidates(first, last, domain) {
   }
   return out;
 }
+function matchesName(email, prenom, nom) {
+  const local = (email.split("@")[0] || "").toLowerCase();
+  const f = slug(prenom), l = slug(nom);
+  return (l.length >= 3 && local.includes(l.slice(0, 4))) || (f.length >= 4 && local.includes(f.slice(0, 4)));
+}
+function isJunk(e) { return JUNK.some(j => e.includes(j)); }
+
 const mxCache = {};
 async function hasMx(domain) {
   if (domain in mxCache) return mxCache[domain];
   try {
     const mx = await dns.resolveMx(domain);
     const ok = Array.isArray(mx) && mx.length > 0;
-    mxCache[domain] = ok;
-    return ok;
+    mxCache[domain] = ok; return ok;
   } catch { mxCache[domain] = false; return false; }
+}
+async function fetchText(url, ms) {
+  try {
+    const opt = { headers: { "User-Agent": "Mozilla/5.0 (compatible; ProspectFinder/1.0)" }, redirect: "follow" };
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(ms);
+    const r = await fetch(url, opt);
+    if (!r.ok) return "";
+    return await r.text();
+  } catch { return ""; }
+}
+
+// --- Option B : trouver le vrai domaine via Google Programmable Search ---
+async function googleFindDomain(company, key, cx, debug) {
+  try {
+    const u = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=3&q=${encodeURIComponent(company)}`;
+    const opt = {};
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(6000);
+    const r = await fetch(u, opt);
+    const data = await r.json();
+    if (data.error) { if (debug && debug.length < 3) debug.push({ google: data.error.message }); return ""; }
+    for (const item of data.items || []) {
+      let host = "";
+      try { host = new URL(item.link).hostname.replace(/^www\./, ""); } catch { continue; }
+      if (SOCIAL.test(host)) continue;
+      return host;
+    }
+  } catch (e) { if (debug && debug.length < 3) debug.push({ google: String(e.message || e) }); }
+  return "";
+}
+
+// --- Option A : scraper les emails publiés sur le site ---
+async function scrapeEmails(domain) {
+  const paths = ["", "/contact", "/mentions-legales"];
+  const texts = await Promise.all(paths.map(p => fetchText(`https://${domain}${p}`, 4500)));
+  const found = new Set();
+  for (const t of texts) {
+    for (const m of (t.match(EMAIL_SCRAPE_RE) || [])) {
+      const e = m.toLowerCase();
+      if (isJunk(e)) continue;
+      const host = e.split("@")[1] || "";
+      if (host.endsWith(domain) || domain.includes(host.split(".").slice(-2)[0] || "###")) found.add(e);
+    }
+  }
+  return [...found];
+}
+
+async function findDomain(company, google, verifyMx, debug) {
+  const guesses = guessDomains(company);
+  if (verifyMx) {
+    for (const d of guesses) { if (await hasMx(d)) return { domain: d, mxOk: true }; }
+    if (google.key && google.cx) {
+      const d = await googleFindDomain(company, google.key, google.cx, debug);
+      if (d) return { domain: d, mxOk: await hasMx(d) };
+    }
+    return { domain: "", mxOk: false };
+  }
+  if (google.key && google.cx) {
+    const d = await googleFindDomain(company, google.key, google.cx, debug);
+    if (d) return { domain: d, mxOk: false };
+  }
+  return { domain: guesses[0] || "", mxOk: false };
 }
 
 async function fetchFrancePage({ q, code, page, dept, postal, debug }) {
@@ -106,26 +174,34 @@ async function searchOpenCorporates({ keywords, jurisdiction, token, perPage }) 
   } catch { return []; }
 }
 
-async function enrichBatch(rows, { genEmails, verifyMx }) {
-  if (!genEmails) { rows.forEach(r => { r.email = ""; r.email_statut = ""; r.email_score = 0; r.domaine = ""; }); return; }
-  await Promise.all(rows.map(async (row) => {
-    const domains = guessDomains(row.entreprise);
-    let domain = "", mxOk = false;
-    for (const d of domains) {
-      if (verifyMx) { if (await hasMx(d)) { domain = d; mxOk = true; break; } }
-      else { domain = d; break; }
-    }
-    row.domaine = domain;
-    if (domain && (row.prenom || row.nom)) {
-      const cands = emailCandidates(row.prenom, row.nom, domain);
-      if (cands.length) {
-        const [email, w] = cands[0];
-        row.email = email;
-        row.email_score = Math.min((mxOk ? 30 : 0) + Math.min(w, 35) + 20, 95);
-        row.email_statut = mxOk ? "probable (MX OK)" : "estimé";
-      } else { row.email = ""; row.email_statut = ""; row.email_score = 0; }
-    } else { row.email = ""; row.email_statut = ""; row.email_score = 0; }
-  }));
+async function enrichRow(row, { genEmails, verifyMx, doScrape, google, debug }) {
+  if (!genEmails) { row.email = ""; row.email_statut = ""; row.email_score = 0; row.domaine = ""; return; }
+  const { domain, mxOk } = await findDomain(row.entreprise, google, verifyMx, debug);
+  row.domaine = domain;
+  if (!domain) { row.email = ""; row.email_statut = "domaine introuvable"; row.email_score = 0; return; }
+  let scraped = [];
+  if (doScrape) { try { scraped = await scrapeEmails(domain); } catch { scraped = []; } }
+  // 1) email scrapé correspondant au dirigeant -> confirmé
+  const personal = scraped.find(e => matchesName(e, row.prenom, row.nom));
+  if (personal) { row.email = personal; row.email_statut = "confirmé (site)"; row.email_score = 96; return; }
+  // 2) email reconstruit par pattern
+  const cands = emailCandidates(row.prenom, row.nom, domain);
+  if (cands.length) {
+    const [email, w] = cands[0];
+    row.email = email;
+    row.email_score = Math.min((mxOk ? 30 : 0) + Math.min(w, 35) + 20, 95);
+    row.email_statut = mxOk ? "probable (MX OK)" : "estimé";
+    return;
+  }
+  // 3) email générique trouvé sur le site (contact@…)
+  if (scraped.length) { row.email = scraped[0]; row.email_statut = "générique (site)"; row.email_score = 45; return; }
+  row.email = ""; row.email_statut = ""; row.email_score = 0;
+}
+
+async function enrichBatch(rows, opts) {
+  for (let i = 0; i < rows.length; i += ENRICH_CONCURRENCY) {
+    await Promise.all(rows.slice(i, i + ENRICH_CONCURRENCY).map(r => enrichRow(r, opts)));
+  }
 }
 
 module.exports = async (req, res) => {
@@ -141,10 +217,12 @@ module.exports = async (req, res) => {
 
   const {
     countries = ["FR"], keywords = "", naf = [], dept = "", postal = "",
-    genEmails = true, verifyMx = true, ocToken = "",
+    genEmails = true, verifyMx = true, doScrape = true, ocToken = "",
+    googleKey = "", googleCx = "",
     target = 50, haveEmails = 0, cursor = null,
   } = body;
 
+  const google = { key: googleKey, cx: googleCx };
   const start = Date.now();
   const debug = [];
   const rows = [];
@@ -156,18 +234,19 @@ module.exports = async (req, res) => {
 
     if (!cursor && otherCountries.length) {
       for (const c of otherCountries) {
-        rows.push(...await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 }));
+        const oc = await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 });
+        await enrichBatch(oc, { genEmails, verifyMx, doScrape, google, debug });
+        rows.push(...oc);
       }
     }
 
-    let exhausted = true;
-    let nextCursor = null;
+    let exhausted = true, nextCursor = null;
     if (wantFR) {
       const queries = keywords ? [{ q: keywords }] : (naf.length ? naf : NAF_DEFAULT).map(code => ({ code }));
       let qi = cursor?.qi || 0;
       let page = cursor?.page || 1;
       exhausted = false;
-
+      const seenKeys = new Set();
       while (qi < queries.length) {
         if (Date.now() - start > TIME_BUDGET_MS) break;
         if (haveEmails + batchEmails >= target) break;
@@ -176,13 +255,17 @@ module.exports = async (req, res) => {
         if (items === null || items.length === 0) { qi++; page = 1; continue; }
         let pageRows = [];
         for (const it of items) pageRows.push(...normalizeFr(it));
-        await enrichBatch(pageRows, { genEmails, verifyMx });
+        pageRows = pageRows.filter(r => {
+          const k = (r.entreprise + "|" + r.nom + "|" + r.prenom).toLowerCase();
+          if (seenKeys.has(k)) return false;
+          seenKeys.add(k); return true;
+        });
+        await enrichBatch(pageRows, { genEmails, verifyMx, doScrape, google, debug });
         for (const r of pageRows) { rows.push(r); if (r.email) batchEmails++; }
         page++;
         if (page > MAX_PAGES_PER_QUERY) { qi++; page = 1; }
       }
-      if (qi >= queries.length) exhausted = true;
-      else nextCursor = { qi, page };
+      if (qi >= queries.length) exhausted = true; else nextCursor = { qi, page };
     }
 
     rows.sort((a, b) => {
