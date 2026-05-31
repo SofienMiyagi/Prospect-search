@@ -111,10 +111,9 @@
       </div>
 
       <div class="field">
-        <label>Recherche web Google (optionnel)</label>
-        <input type="text" id="googleKey" placeholder="Clé API Google" style="margin-bottom:6px">
-        <input type="text" id="googleCx" placeholder="ID moteur (cx)">
-        <div class="hintsmall">Trouve le <b>vrai domaine</b> quand le nom ≠ site web (débloque beaucoup plus d'emails). Clé : <a href="https://developers.google.com/custom-search/v1/introduction" target="_blank">API Custom Search</a> · Moteur : <a href="https://programmablesearchengine.google.com/" target="_blank">cx</a> (régler sur « tout le web »). 100 req/jour gratuites.</div>
+        <label>Recherche web — clé Brave (optionnel)</label>
+        <input type="text" id="braveKey" placeholder="Laisser vide = DuckDuckGo gratuit">
+        <div class="hintsmall">Par défaut, l'outil utilise <b>DuckDuckGo</b> (gratuit, sans inscription) pour trouver les sites et débloquer les pays hors FR. Si DuckDuckGo bloque le serveur, ajoute une clé <a href="https://api-dashboard.search.brave.com/" target="_blank">Brave Search</a> (5 $ de crédit/mois ≈ 1000 requêtes, carte requise) pour fiabiliser.</div>
       </div>
 
       <div class="field">
@@ -197,8 +196,7 @@ async function search(){
     naf: document.getElementById("naf").value.split(",").map(x=>x.trim()).filter(Boolean),
     dept: document.getElementById("dept").value.trim(),
     ocToken: document.getElementById("ocToken").value.trim(),
-    googleKey: document.getElementById("googleKey").value.trim(),
-    googleCx: document.getElementById("googleCx").value.trim(),
+    braveKey: document.getElementById("braveKey").value.trim(),
     genEmails: document.getElementById("sw-email").classList.contains("on"),
     verifyMx: document.getElementById("sw-mx").classList.contains("on"),
     doScrape: document.getElementById("sw-scrape").classList.contains("on"),
