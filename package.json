@@ -1,0 +1,9 @@
+{
+  "name": "prospect-finder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agrégateur de prospects B2B à partir de sources publiques gratuites (registres d'entreprises, WHOIS, MX).",
+  "engines": {
+    "node": ">=18"
+  }
+}
