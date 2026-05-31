@@ -56,7 +56,7 @@ async function hasMx(domain) {
 }
 
 // ----------------------- registre FRANCE -----------------------
-async function searchFrance({ keywords, naf, dept, postal, pages }) {
+async function searchFrance({ keywords, naf, dept, postal, pages, debug }) {
   const codes = (naf && naf.length) ? naf : NAF_DEFAULT;
   const base = "https://recherche-entreprises.api.gouv.fr/search";
   const rows = [];
@@ -64,17 +64,26 @@ async function searchFrance({ keywords, naf, dept, postal, pages }) {
 
   for (const code of queries) {
     for (let page = 1; page <= pages; page++) {
-      const p = new URLSearchParams({ per_page: "25", page: String(page), include: "dirigeants,siege" });
+      const p = new URLSearchParams({ per_page: "25", page: String(page) });
       if (keywords) p.set("q", keywords);
       if (code) p.set("activite_principale", code);
       if (dept) p.set("departement", dept);
       if (postal) p.set("code_postal", postal);
+      const url = `${base}?${p}`;
       let data;
       try {
-        const r = await fetch(`${base}?${p}`, { headers: { "User-Agent": "ProspectFinder/1.0" } });
-        if (!r.ok) break;
-        data = await r.json();
-      } catch { break; }
+        const r = await fetch(url, { headers: { "User-Agent": "ProspectFinder/1.0", "Accept": "application/json" } });
+        const text = await r.text();
+        if (!r.ok) {
+          debug.push({ q: code || keywords, status: r.status, body: text.slice(0, 180) });
+          break;
+        }
+        data = JSON.parse(text);
+        if (page === 1) debug.push({ q: code || keywords, status: 200, total: data.total_results, got: (data.results || []).length });
+      } catch (e) {
+        debug.push({ q: code || keywords, error: String(e.message || e) });
+        break;
+      }
       const items = data.results || [];
       if (!items.length) break;
       for (const it of items) rows.push(...normalizeFr(it));
@@ -171,9 +180,10 @@ module.exports = async (req, res) => {
 
   try {
     let rows = [];
+    const debug = [];
     for (const c of countries) {
       if (String(c).toUpperCase() === "FR") {
-        rows.push(...await searchFrance({ keywords, naf, dept, postal, pages }));
+        rows.push(...await searchFrance({ keywords, naf, dept, postal, pages, debug }));
       } else {
         rows.push(...await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 }));
       }
@@ -189,7 +199,7 @@ module.exports = async (req, res) => {
 
     rows = await enrich(rows, { genEmails, verifyMx, maxEnrich });
 
-    res.status(200).json({ count: rows.length, results: rows });
+    res.status(200).json({ count: rows.length, results: rows, _debug: debug });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
