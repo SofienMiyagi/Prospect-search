@@ -192,6 +192,9 @@ async function search(){
     render();
     document.getElementById("stat").innerHTML = `<b>${DATA.length}</b> prospects trouvés`;
     document.getElementById("csv").disabled = DATA.length===0;
+    if(DATA.length===0 && data._debug){
+      showErr("Diagnostic API : "+JSON.stringify(data._debug));
+    }
   }catch(e){
     showErr("Erreur : "+e.message);
     document.getElementById("stat").textContent = "Échec de la recherche";
