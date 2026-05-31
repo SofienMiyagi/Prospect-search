@@ -1,6 +1,6 @@
 // Vercel Serverless Function — /api/search
-// Registres publics + PAGINATION CONTINUE + découverte de domaine (Google) + scraping site.
-// Priorité email : confirmé (site) > probable (pattern+MX) > estimé > générique (site).
+// Registres publics + pagination continue + recherche web (DuckDuckGo gratuit, ou Brave en option)
+// pour découvrir les domaines/entreprises, puis scraping des sites pour les emails.
 
 const dns = require("dns").promises;
 
@@ -12,7 +12,15 @@ const ENRICH_CONCURRENCY = 10;
 const EMAIL_SCRAPE_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 const JUNK = ["example.", "sentry", "wixpress", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
   "your-email", "yourname", "yourdomain", "domain.com", "email@", "u003e", "@2x", "name@", "nom@"];
-const SOCIAL = /linkedin|facebook|youtube|wikipedia|societe\.com|verif\.|infogreffe|pappers|google\.|twitter|x\.com|instagram|pagesjaunes|annuaire|indeed|glassdoor|mappy|yelp|tripadvisor/i;
+const SOCIAL = /linkedin|facebook|youtube|wikipedia|societe\.com|verif\.|infogreffe|pappers|google\.|twitter|x\.com|instagram|pagesjaunes|annuaire|indeed|glassdoor|mappy|yelp|tripadvisor|duckduckgo|bing\.|amazon\.|ebay\./i;
+
+const COUNTRY_NAMES = {
+  FR: "France", GB: "United Kingdom", UK: "United Kingdom", DE: "Germany", BE: "Belgium",
+  IT: "Italy", ES: "Spain", NL: "Netherlands", PT: "Portugal", CH: "Switzerland",
+  AT: "Austria", PL: "Poland", SE: "Sweden", DK: "Denmark", NO: "Norway", FI: "Finland",
+  IE: "Ireland", LU: "Luxembourg", CZ: "Czech Republic", US: "United States", CA: "Canada",
+  MA: "Maroc", TN: "Tunisie", DZ: "Algérie",
+};
 
 function slug(s) {
   if (!s) return "";
@@ -55,9 +63,9 @@ async function hasMx(domain) {
     mxCache[domain] = ok; return ok;
   } catch { mxCache[domain] = false; return false; }
 }
-async function fetchText(url, ms) {
+async function fetchText(url, ms, opts) {
   try {
-    const opt = { headers: { "User-Agent": "Mozilla/5.0 (compatible; ProspectFinder/1.0)" }, redirect: "follow" };
+    const opt = Object.assign({ headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" }, redirect: "follow" }, opts || {});
     if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(ms);
     const r = await fetch(url, opt);
     if (!r.ok) return "";
@@ -65,26 +73,60 @@ async function fetchText(url, ms) {
   } catch { return ""; }
 }
 
-// --- Option B : trouver le vrai domaine via Google Programmable Search ---
-async function googleFindDomain(company, key, cx, debug) {
+// ---------- RECHERCHE WEB : Brave (si clé) sinon DuckDuckGo (gratuit) ----------
+async function braveSearch(query, cap, key, debug) {
   try {
-    const u = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=3&q=${encodeURIComponent(company)}`;
-    const opt = {};
-    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(6000);
+    const u = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${Math.min(cap * 2, 20)}`;
+    const opt = { headers: { "Accept": "application/json", "X-Subscription-Token": key } };
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(7000);
     const r = await fetch(u, opt);
     const data = await r.json();
-    if (data.error) { if (debug && debug.length < 3) debug.push({ google: data.error.message }); return ""; }
-    for (const item of data.items || []) {
-      let host = "";
-      try { host = new URL(item.link).hostname.replace(/^www\./, ""); } catch { continue; }
-      if (SOCIAL.test(host)) continue;
-      return host;
+    if (!data.web || !data.web.results) { debug.push({ brave: data.error?.detail || data.message || ("status " + r.status) }); return []; }
+    const out = [], seen = new Set();
+    for (const it of data.web.results) {
+      let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
+      if (SOCIAL.test(host) || seen.has(host)) continue;
+      seen.add(host);
+      out.push({ company: (it.title || "").split(/[|\-–·:]/)[0].trim() || host, domain: host });
+      if (out.length >= cap) break;
     }
-  } catch (e) { if (debug && debug.length < 3) debug.push({ google: String(e.message || e) }); }
-  return "";
+    return out;
+  } catch (e) { debug.push({ brave: String(e.message || e) }); return []; }
 }
 
-// --- Option A : scraper les emails publiés sur le site ---
+async function ddgSearch(query, cap, debug) {
+  const out = [], seen = new Set();
+  try {
+    const u = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const text = await fetchText(u, 7000);
+    if (!text) { debug.push({ ddg: "pas de réponse (peut être bloqué depuis le serveur)" }); return out; }
+    const re = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = re.exec(text)) && out.length < cap) {
+      let href = m[1].replace(/&amp;/g, "&");
+      const title = m[2].replace(/<[^>]+>/g, "").trim();
+      const uddg = href.match(/[?&]uddg=([^&]+)/);
+      let real = uddg ? decodeURIComponent(uddg[1]) : href;
+      if (real.startsWith("//")) real = "https:" + real;
+      let host = ""; try { host = new URL(real).hostname.replace(/^www\./, ""); } catch { continue; }
+      if (SOCIAL.test(host) || seen.has(host)) continue;
+      seen.add(host);
+      out.push({ company: title.split(/[|\-–·:]/)[0].trim() || host, domain: host });
+    }
+    if (!out.length) debug.push({ ddg: "0 résultat extrait" });
+  } catch (e) { debug.push({ ddg: String(e.message || e) }); }
+  return out;
+}
+
+async function webSearch(query, cap, search, debug) {
+  if (search.braveKey) {
+    const b = await braveSearch(query, cap, search.braveKey, debug);
+    if (b.length) return b;
+  }
+  return await ddgSearch(query, cap, debug);
+}
+
+// ---------- Option A : scraper les emails publiés sur le site ----------
 async function scrapeEmails(domain) {
   const paths = ["", "/contact", "/mentions-legales"];
   const texts = await Promise.all(paths.map(p => fetchText(`https://${domain}${p}`, 4500)));
@@ -100,21 +142,32 @@ async function scrapeEmails(domain) {
   return [...found];
 }
 
-async function findDomain(company, google, verifyMx, debug) {
+async function findDomain(company, search, verifyMx, debug) {
   const guesses = guessDomains(company);
   if (verifyMx) {
     for (const d of guesses) { if (await hasMx(d)) return { domain: d, mxOk: true }; }
-    if (google.key && google.cx) {
-      const d = await googleFindDomain(company, google.key, google.cx, debug);
-      if (d) return { domain: d, mxOk: await hasMx(d) };
-    }
+    const res = await webSearch(company, 1, search, debug);
+    if (res[0]) return { domain: res[0].domain, mxOk: await hasMx(res[0].domain) };
     return { domain: "", mxOk: false };
   }
-  if (google.key && google.cx) {
-    const d = await googleFindDomain(company, google.key, google.cx, debug);
-    if (d) return { domain: d, mxOk: false };
-  }
+  const res = await webSearch(company, 1, search, debug);
+  if (res[0]) return { domain: res[0].domain, mxOk: false };
   return { domain: guesses[0] || "", mxOk: false };
+}
+
+// ---------- découverte d'entreprises hors-FR ----------
+async function discoverNonFR(code, keywords, search, doScrape, debug) {
+  const name = COUNTRY_NAMES[String(code).toUpperCase()] || code;
+  const found = await webSearch(`${keywords || "ventilation aéraulique HVAC fabricant distributeur"} ${name}`, 10, search, debug);
+  const out = [];
+  await Promise.all(found.map(async ({ company, domain }) => {
+    let email = "", statut = "", score = 0;
+    if (doScrape) {
+      try { const scraped = await scrapeEmails(domain); if (scraped.length) { email = scraped[0]; statut = "générique (site)"; score = 45; } } catch {}
+    }
+    out.push({ prenom: "", nom: "", poste: "", entreprise: company || domain, secteur: keywords || "", pays: name, ville: "", adresse: "", siren: "", domaine: domain, email, email_statut: statut, email_score: score, source: "Web" });
+  }));
+  return out;
 }
 
 async function fetchFrancePage({ q, code, page, dept, postal, debug }) {
@@ -143,102 +196,18 @@ function normalizeFr(it) {
   const base = { entreprise: company, secteur, pays: "France", ville, adresse: addr, siren: it.siren || "", source: "Registre FR (data.gouv)" };
   const persons = (it.dirigeants || []).filter(d => d.nom || d.prenoms);
   if (!persons.length) return [{ ...base, prenom: "", nom: "", poste: "" }];
-  return persons.slice(0, 3).map(d => ({
-    ...base,
-    prenom: (d.prenoms || "").split(" ")[0] || "",
-    nom: d.nom || "",
-    poste: d.qualite || "Dirigeant",
-  }));
+  return persons.slice(0, 3).map(d => ({ ...base, prenom: (d.prenoms || "").split(" ")[0] || "", nom: d.nom || "", poste: d.qualite || "Dirigeant" }));
 }
 
-async function searchOpenCorporates({ keywords, jurisdiction, token, perPage }) {
-  const base = "https://api.opencorporates.com/v0.4/companies/search";
-  const p = new URLSearchParams({ q: keywords || "ventilation", per_page: String(perPage || 25) });
-  if (jurisdiction) p.set("jurisdiction_code", jurisdiction);
-  if (token) p.set("api_token", token);
-  try {
-    const r = await fetch(`${base}?${p}`, { headers: { "User-Agent": "ProspectFinder/1.0" } });
-    if (!r.ok) return [];
-    const data = await r.json();
-    const comps = data?.results?.companies || [];
-    return comps.map(({ company }) => ({
-      prenom: "", nom: "", poste: "",
-      entreprise: company.name || "",
-      secteur: company.industry_codes?.[0]?.industry_code?.description || (company.company_type || ""),
-      pays: company.jurisdiction_code?.toUpperCase() || (jurisdiction || "").toUpperCase(),
-      ville: company.registered_address?.locality || "",
-      adresse: company.registered_address_in_full || "",
-      siren: company.company_number || "",
-      source: "OpenCorporates",
-    }));
-  } catch { return []; }
-}
-
-const COUNTRY_NAMES = {
-  FR: "France", GB: "United Kingdom", UK: "United Kingdom", DE: "Germany", BE: "Belgium",
-  IT: "Italy", ES: "Spain", NL: "Netherlands", PT: "Portugal", CH: "Switzerland",
-  AT: "Austria", PL: "Poland", SE: "Sweden", DK: "Denmark", NO: "Norway", FI: "Finland",
-  IE: "Ireland", LU: "Luxembourg", CZ: "Czech Republic", US: "United States", CA: "Canada",
-  MA: "Maroc", TN: "Tunisie", DZ: "Algérie",
-};
-
-// Découverte d'entreprises hors-FR via Google Programmable Search (sites du secteur)
-async function googleDiscover(keywords, countryName, key, cx, cap, debug) {
-  const q = `${keywords || "ventilation aéraulique HVAC fabricant distributeur"} ${countryName}`;
-  const out = [], seen = new Set();
-  for (let start = 1; start <= 11 && out.length < cap; start += 10) {
-    try {
-      const u = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=10&start=${start}&q=${encodeURIComponent(q)}`;
-      const opt = {};
-      if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(6000);
-      const r = await fetch(u, opt);
-      const data = await r.json();
-      if (data.error) { debug.push({ google_discover: data.error.message }); break; }
-      for (const item of data.items || []) {
-        let host = "";
-        try { host = new URL(item.link).hostname.replace(/^www\./, ""); } catch { continue; }
-        if (SOCIAL.test(host) || seen.has(host)) continue;
-        seen.add(host);
-        out.push({ company: (item.title || "").split(/[|\-–·:]/)[0].trim() || host, domain: host });
-        if (out.length >= cap) break;
-      }
-    } catch (e) { debug.push({ google_discover: String(e.message || e) }); break; }
-  }
-  return out;
-}
-
-async function discoverNonFR(code, keywords, google, doScrape, debug) {
-  const name = COUNTRY_NAMES[String(code).toUpperCase()] || code;
-  const found = await googleDiscover(keywords, name, google.key, google.cx, 8, debug);
-  const out = [];
-  await Promise.all(found.map(async ({ company, domain }) => {
-    let email = "", statut = "", score = 0;
-    if (doScrape) {
-      try {
-        const scraped = await scrapeEmails(domain);
-        if (scraped.length) { email = scraped[0]; statut = "générique (site)"; score = 45; }
-      } catch {}
-    }
-    out.push({
-      prenom: "", nom: "", poste: "", entreprise: company || domain,
-      secteur: keywords || "", pays: name, ville: "", adresse: "", siren: "",
-      domaine: domain, email, email_statut: statut, email_score: score, source: "Web (Google)",
-    });
-  }));
-  return out;
-}
-
-async function enrichRow(row, { genEmails, verifyMx, doScrape, google, debug }) {
+async function enrichRow(row, { genEmails, verifyMx, doScrape, search, debug }) {
   if (!genEmails) { row.email = ""; row.email_statut = ""; row.email_score = 0; row.domaine = ""; return; }
-  const { domain, mxOk } = await findDomain(row.entreprise, google, verifyMx, debug);
+  const { domain, mxOk } = await findDomain(row.entreprise, search, verifyMx, debug);
   row.domaine = domain;
   if (!domain) { row.email = ""; row.email_statut = "domaine introuvable"; row.email_score = 0; return; }
   let scraped = [];
   if (doScrape) { try { scraped = await scrapeEmails(domain); } catch { scraped = []; } }
-  // 1) email scrapé correspondant au dirigeant -> confirmé
   const personal = scraped.find(e => matchesName(e, row.prenom, row.nom));
   if (personal) { row.email = personal; row.email_statut = "confirmé (site)"; row.email_score = 96; return; }
-  // 2) email reconstruit par pattern
   const cands = emailCandidates(row.prenom, row.nom, domain);
   if (cands.length) {
     const [email, w] = cands[0];
@@ -247,7 +216,6 @@ async function enrichRow(row, { genEmails, verifyMx, doScrape, google, debug }) 
     row.email_statut = mxOk ? "probable (MX OK)" : "estimé";
     return;
   }
-  // 3) email générique trouvé sur le site (contact@…)
   if (scraped.length) { row.email = scraped[0]; row.email_statut = "générique (site)"; row.email_score = 45; return; }
   row.email = ""; row.email_statut = ""; row.email_score = 0;
 }
@@ -271,12 +239,11 @@ module.exports = async (req, res) => {
 
   const {
     countries = ["FR"], keywords = "", naf = [], dept = "", postal = "",
-    genEmails = true, verifyMx = true, doScrape = true, ocToken = "",
-    googleKey = "", googleCx = "",
+    genEmails = true, verifyMx = true, doScrape = true, braveKey = "",
     target = 50, haveEmails = 0, cursor = null,
   } = body;
 
-  const google = { key: googleKey, cx: googleCx };
+  const search = { braveKey };
   const start = Date.now();
   const debug = [];
   const notes = [];
@@ -289,19 +256,10 @@ module.exports = async (req, res) => {
 
     if (!cursor && otherCountries.length) {
       for (const c of otherCountries) {
-        if (google.key && google.cx) {
-          const disc = await discoverNonFR(c, keywords, google, doScrape, debug);
-          rows.push(...disc);
-          for (const r of disc) if (r.email) batchEmails++;
-          if (!disc.length) notes.push(`${c} : aucun site trouvé via Google pour ces mots-clés.`);
-        } else if (ocToken) {
-          const oc = await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 });
-          await enrichBatch(oc, { genEmails, verifyMx, doScrape, google, debug });
-          rows.push(...oc);
-          for (const r of oc) if (r.email) batchEmails++;
-        } else {
-          notes.push(`${c} : la recherche hors France nécessite une clé Google (champ « Recherche web Google ») — aucun registre gratuit avec dirigeants n'existe pour ce pays.`);
-        }
+        const disc = await discoverNonFR(c, keywords, search, doScrape, debug);
+        rows.push(...disc);
+        for (const r of disc) if (r.email) batchEmails++;
+        if (!disc.length) notes.push(`${c} : aucun résultat web (DuckDuckGo a peut-être bloqué le serveur — ajoutez une clé Brave pour fiabiliser).`);
       }
     }
 
@@ -322,10 +280,9 @@ module.exports = async (req, res) => {
         for (const it of items) pageRows.push(...normalizeFr(it));
         pageRows = pageRows.filter(r => {
           const k = (r.entreprise + "|" + r.nom + "|" + r.prenom).toLowerCase();
-          if (seenKeys.has(k)) return false;
-          seenKeys.add(k); return true;
+          if (seenKeys.has(k)) return false; seenKeys.add(k); return true;
         });
-        await enrichBatch(pageRows, { genEmails, verifyMx, doScrape, google, debug });
+        await enrichBatch(pageRows, { genEmails, verifyMx, doScrape, search, debug });
         for (const r of pageRows) { rows.push(r); if (r.email) batchEmails++; }
         page++;
         if (page > MAX_PAGES_PER_QUERY) { qi++; page = 1; }
