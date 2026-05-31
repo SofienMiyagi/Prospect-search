@@ -174,6 +174,60 @@ async function searchOpenCorporates({ keywords, jurisdiction, token, perPage }) 
   } catch { return []; }
 }
 
+const COUNTRY_NAMES = {
+  FR: "France", GB: "United Kingdom", UK: "United Kingdom", DE: "Germany", BE: "Belgium",
+  IT: "Italy", ES: "Spain", NL: "Netherlands", PT: "Portugal", CH: "Switzerland",
+  AT: "Austria", PL: "Poland", SE: "Sweden", DK: "Denmark", NO: "Norway", FI: "Finland",
+  IE: "Ireland", LU: "Luxembourg", CZ: "Czech Republic", US: "United States", CA: "Canada",
+  MA: "Maroc", TN: "Tunisie", DZ: "Algérie",
+};
+
+// Découverte d'entreprises hors-FR via Google Programmable Search (sites du secteur)
+async function googleDiscover(keywords, countryName, key, cx, cap, debug) {
+  const q = `${keywords || "ventilation aéraulique HVAC fabricant distributeur"} ${countryName}`;
+  const out = [], seen = new Set();
+  for (let start = 1; start <= 11 && out.length < cap; start += 10) {
+    try {
+      const u = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=10&start=${start}&q=${encodeURIComponent(q)}`;
+      const opt = {};
+      if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(6000);
+      const r = await fetch(u, opt);
+      const data = await r.json();
+      if (data.error) { debug.push({ google_discover: data.error.message }); break; }
+      for (const item of data.items || []) {
+        let host = "";
+        try { host = new URL(item.link).hostname.replace(/^www\./, ""); } catch { continue; }
+        if (SOCIAL.test(host) || seen.has(host)) continue;
+        seen.add(host);
+        out.push({ company: (item.title || "").split(/[|\-–·:]/)[0].trim() || host, domain: host });
+        if (out.length >= cap) break;
+      }
+    } catch (e) { debug.push({ google_discover: String(e.message || e) }); break; }
+  }
+  return out;
+}
+
+async function discoverNonFR(code, keywords, google, doScrape, debug) {
+  const name = COUNTRY_NAMES[String(code).toUpperCase()] || code;
+  const found = await googleDiscover(keywords, name, google.key, google.cx, 8, debug);
+  const out = [];
+  await Promise.all(found.map(async ({ company, domain }) => {
+    let email = "", statut = "", score = 0;
+    if (doScrape) {
+      try {
+        const scraped = await scrapeEmails(domain);
+        if (scraped.length) { email = scraped[0]; statut = "générique (site)"; score = 45; }
+      } catch {}
+    }
+    out.push({
+      prenom: "", nom: "", poste: "", entreprise: company || domain,
+      secteur: keywords || "", pays: name, ville: "", adresse: "", siren: "",
+      domaine: domain, email, email_statut: statut, email_score: score, source: "Web (Google)",
+    });
+  }));
+  return out;
+}
+
 async function enrichRow(row, { genEmails, verifyMx, doScrape, google, debug }) {
   if (!genEmails) { row.email = ""; row.email_statut = ""; row.email_score = 0; row.domaine = ""; return; }
   const { domain, mxOk } = await findDomain(row.entreprise, google, verifyMx, debug);
@@ -225,6 +279,7 @@ module.exports = async (req, res) => {
   const google = { key: googleKey, cx: googleCx };
   const start = Date.now();
   const debug = [];
+  const notes = [];
   const rows = [];
   let batchEmails = 0;
 
@@ -234,9 +289,19 @@ module.exports = async (req, res) => {
 
     if (!cursor && otherCountries.length) {
       for (const c of otherCountries) {
-        const oc = await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 });
-        await enrichBatch(oc, { genEmails, verifyMx, doScrape, google, debug });
-        rows.push(...oc);
+        if (google.key && google.cx) {
+          const disc = await discoverNonFR(c, keywords, google, doScrape, debug);
+          rows.push(...disc);
+          for (const r of disc) if (r.email) batchEmails++;
+          if (!disc.length) notes.push(`${c} : aucun site trouvé via Google pour ces mots-clés.`);
+        } else if (ocToken) {
+          const oc = await searchOpenCorporates({ keywords, jurisdiction: String(c).toLowerCase(), token: ocToken, perPage: 25 });
+          await enrichBatch(oc, { genEmails, verifyMx, doScrape, google, debug });
+          rows.push(...oc);
+          for (const r of oc) if (r.email) batchEmails++;
+        } else {
+          notes.push(`${c} : la recherche hors France nécessite une clé Google (champ « Recherche web Google ») — aucun registre gratuit avec dirigeants n'existe pour ce pays.`);
+        }
       }
     }
 
@@ -274,7 +339,7 @@ module.exports = async (req, res) => {
       return (b.email_score || 0) - (a.email_score || 0);
     });
 
-    res.status(200).json({ count: rows.length, withEmail: batchEmails, results: rows, cursor: nextCursor, exhausted, _debug: debug });
+    res.status(200).json({ count: rows.length, withEmail: batchEmails, results: rows, cursor: nextCursor, exhausted, notes, _debug: debug });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
