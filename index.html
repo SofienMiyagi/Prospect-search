@@ -19,7 +19,7 @@
   .wrap{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 67px)}
   .panel{border-right:1px solid var(--border);padding:20px;display:flex;flex-direction:column;gap:20px;overflow-y:auto}
   .field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:7px;font-weight:600}
-  input[type=text],textarea,select{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:9px 11px;color:var(--text);font-family:inherit;font-size:13px;outline:none;transition:border .15s}
+  input[type=text],input[type=number],textarea,select{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:9px 11px;color:var(--text);font-family:inherit;font-size:13px;outline:none;transition:border .15s}
   input[type=text]:focus,textarea:focus{border-color:var(--accent)}
   textarea{resize:vertical;min-height:54px}
   .countries{display:flex;flex-wrap:wrap;gap:6px}
@@ -110,6 +110,12 @@
       </div>
 
       <div class="field">
+        <label>Nombre de prospects (avec email)</label>
+        <input type="number" id="target" value="50" min="1" max="500" step="10">
+        <div class="hintsmall">L'outil continue de chercher jusqu'à atteindre ce nombre de prospects <b>avec email</b>. Ceux sans email sont ajoutés en bas de liste.</div>
+      </div>
+
+      <div class="field">
         <label>Options</label>
         <div class="toggle"><span>Générer les emails</span><div class="switch on" id="sw-email" onclick="toggle('sw-email')"></div></div>
         <div class="toggle"><span>Vérifier MX (domaine)</span><div class="switch on" id="sw-mx" onclick="toggle('sw-mx')"></div></div>
@@ -168,12 +174,13 @@ async function search(){
   const btn = document.getElementById("run");
   btn.disabled = true;
   document.getElementById("run-icon").outerHTML = '<span class="spinner" id="run-icon"></span>';
-  document.getElementById("run-label").textContent = "Recherche en cours...";
-  document.getElementById("stat").textContent = "Interrogation des registres publics...";
+  document.getElementById("run-label").textContent = "Recherche...";
   document.getElementById("errbox").innerHTML = "";
   document.getElementById("csv").disabled = true;
+  DATA = [];
 
-  const payload = {
+  const target = Math.max(1, parseInt(document.getElementById("target").value) || 50);
+  const base = {
     countries: [...selected],
     keywords: document.getElementById("keywords").value.trim(),
     naf: document.getElementById("naf").value.split(",").map(x=>x.trim()).filter(Boolean),
@@ -181,20 +188,37 @@ async function search(){
     ocToken: document.getElementById("ocToken").value.trim(),
     genEmails: document.getElementById("sw-email").classList.contains("on"),
     verifyMx: document.getElementById("sw-mx").classList.contains("on"),
-    pages: 2, maxEnrich: 60,
+    target,
   };
 
+  const seen = new Set();
+  const key = r => (r.entreprise+"|"+r.nom+"|"+r.prenom).toLowerCase();
+  const emailCount = () => DATA.filter(r=>r.email).length;
+
+  let cursor = null, exhausted = false, calls = 0, lastDebug = null;
   try{
-    const r = await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-    const data = await r.json();
-    if(!r.ok) throw new Error(data.error || ("Erreur "+r.status));
-    DATA = data.results || [];
-    render();
-    document.getElementById("stat").innerHTML = `<b>${DATA.length}</b> prospects trouvés`;
-    document.getElementById("csv").disabled = DATA.length===0;
-    if(DATA.length===0 && data._debug){
-      showErr("Diagnostic API : "+JSON.stringify(data._debug));
+    while(calls < 8){
+      calls++;
+      const have = emailCount();
+      if(have >= target || exhausted) break;
+      document.getElementById("stat").innerHTML = `<b>${have}</b>/${target} prospects avec email — recherche en cours${".".repeat(calls%4)}`;
+      const payload = {...base, haveEmails: have, cursor};
+      const r = await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const data = await r.json();
+      if(!r.ok) throw new Error(data.error || ("Erreur "+r.status));
+      lastDebug = data._debug;
+      for(const row of (data.results||[])){ const k=key(row); if(!seen.has(k)){ seen.add(k); DATA.push(row); } }
+      cursor = data.cursor; exhausted = data.exhausted || !cursor;
+      // tri emails d'abord, puis score décroissant
+      DATA.sort((a,b)=>{ const ae=a.email?1:0,be=b.email?1:0; if(ae!==be) return be-ae; return (b.email_score||0)-(a.email_score||0); });
+      render();
+      document.getElementById("csv").disabled = DATA.length===0;
     }
+    const withMail = emailCount();
+    let msg = `<b>${withMail}</b> avec email · <b>${DATA.length}</b> au total`;
+    if(withMail < target && exhausted) msg += ` (sources épuisées avant l'objectif de ${target})`;
+    document.getElementById("stat").innerHTML = msg;
+    if(DATA.length===0 && lastDebug) showErr("Diagnostic API : "+JSON.stringify(lastDebug));
   }catch(e){
     showErr("Erreur : "+e.message);
     document.getElementById("stat").textContent = "Échec de la recherche";
