@@ -110,6 +110,13 @@
       </div>
 
       <div class="field">
+        <label>Recherche web Google (optionnel)</label>
+        <input type="text" id="googleKey" placeholder="Clé API Google" style="margin-bottom:6px">
+        <input type="text" id="googleCx" placeholder="ID moteur (cx)">
+        <div class="hintsmall">Trouve le <b>vrai domaine</b> quand le nom ≠ site web (débloque beaucoup plus d'emails). Clé : <a href="https://developers.google.com/custom-search/v1/introduction" target="_blank">API Custom Search</a> · Moteur : <a href="https://programmablesearchengine.google.com/" target="_blank">cx</a> (régler sur « tout le web »). 100 req/jour gratuites.</div>
+      </div>
+
+      <div class="field">
         <label>Nombre de prospects (avec email)</label>
         <input type="number" id="target" value="50" min="1" max="500" step="10">
         <div class="hintsmall">L'outil continue de chercher jusqu'à atteindre ce nombre de prospects <b>avec email</b>. Ceux sans email sont ajoutés en bas de liste.</div>
@@ -119,6 +126,7 @@
         <label>Options</label>
         <div class="toggle"><span>Générer les emails</span><div class="switch on" id="sw-email" onclick="toggle('sw-email')"></div></div>
         <div class="toggle"><span>Vérifier MX (domaine)</span><div class="switch on" id="sw-mx" onclick="toggle('sw-mx')"></div></div>
+        <div class="toggle"><span>Scraper les sites (emails réels)</span><div class="switch on" id="sw-scrape" onclick="toggle('sw-scrape')"></div></div>
       </div>
 
       <button class="run" id="run" onclick="search()">
@@ -186,8 +194,11 @@ async function search(){
     naf: document.getElementById("naf").value.split(",").map(x=>x.trim()).filter(Boolean),
     dept: document.getElementById("dept").value.trim(),
     ocToken: document.getElementById("ocToken").value.trim(),
+    googleKey: document.getElementById("googleKey").value.trim(),
+    googleCx: document.getElementById("googleCx").value.trim(),
     genEmails: document.getElementById("sw-email").classList.contains("on"),
     verifyMx: document.getElementById("sw-mx").classList.contains("on"),
+    doScrape: document.getElementById("sw-scrape").classList.contains("on"),
     target,
   };
 
@@ -236,8 +247,9 @@ function render(){
   if(!DATA.length){ el.innerHTML = `<div class="empty"><div class="hint">Aucun résultat. Élargissez les mots-clés ou retirez le filtre département.</div></div>`; return; }
   const badge = s => {
     if(!s) return '<span class="badge b-no">—</span>';
+    if(s.includes("confirmé")) return '<span class="badge b-ok">✓ '+s+'</span>';
     if(s.includes("MX")) return '<span class="badge b-ok">'+s+'</span>';
-    if(s.includes("estimé")) return '<span class="badge b-est">'+s+'</span>';
+    if(s.includes("estimé")||s.includes("générique")) return '<span class="badge b-est">'+s+'</span>';
     return '<span class="badge b-no">'+s+'</span>';
   };
   let html = `<table><thead><tr><th>Prospect</th><th>Entreprise</th><th>Email</th><th>Localisation</th><th>Source</th></tr></thead><tbody>`;
