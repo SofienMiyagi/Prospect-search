@@ -1,18 +1,25 @@
 // Vercel Serverless Function — /api/search
-// Registres publics + pagination continue + recherche web (DuckDuckGo gratuit, ou Brave en option)
-// pour découvrir les domaines/entreprises, puis scraping des sites pour les emails.
+// Méta-moteur de recherche (DuckDuckGo, Bing, Mojeek, Brave, Ecosia, SearXNG) +
+// registre public FR + pagination continue + scraping des sites pour les emails.
 
 const dns = require("dns").promises;
 
 const NAF_DEFAULT = ["4322B", "2825Z", "4669B", "4329B", "4321A"];
 const SUFFIXES = /\b(sarl|sas|sasu|sa|eurl|sci|snc|group|groupe|holding|france|international|ltd|limited|gmbh|bv|srl|spa|the|co|inc)\b/gi;
-const TIME_BUDGET_MS = 18000;
+const TIME_BUDGET_MS = 14000;
 const MAX_PAGES_PER_QUERY = 40;
 const ENRICH_CONCURRENCY = 10;
 const EMAIL_SCRAPE_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 const JUNK = ["example.", "sentry", "wixpress", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
   "your-email", "yourname", "yourdomain", "domain.com", "email@", "u003e", "@2x", "name@", "nom@"];
-const SOCIAL = /linkedin|facebook|youtube|wikipedia|societe\.com|verif\.|infogreffe|pappers|google\.|twitter|x\.com|instagram|pagesjaunes|annuaire|indeed|glassdoor|mappy|yelp|tripadvisor|duckduckgo|bing\.|amazon\.|ebay\./i;
+const SOCIAL = /linkedin|facebook|fb\.com|youtube|youtu\.be|wikipedia|twitter|x\.com|instagram|pinterest|tiktok|snapchat/i;
+const SKIP_HOSTS = ["bing.com", "microsoft.com", "msn.com", "duckduckgo.com", "mojeek.com", "ecosia.org",
+  "brave.com", "google.", "gstatic.com", "googleapis.com", "cloudflare", "jsdelivr", "unpkg", "w3.org",
+  "schema.org", "gmpg.org", "gravatar.com", "fonts.", "akamai", "fbcdn", "ytimg", "doubleclick", "paypal.com",
+  "cookielaw.org", "onetrust.com", "searx", "startpage.com", "qwant.com", "yahoo.com", "yandex",
+  "societe.com", "verif.com", "infogreffe", "pappers", "pagesjaunes", "annuaire", "indeed", "glassdoor",
+  "mappy", "yelp", "tripadvisor", "amazon.", "ebay.", "archive.org", "wikimedia"];
+function isSkipHost(h) { return SKIP_HOSTS.some(s => h.includes(s)); }
 
 const COUNTRY_NAMES = {
   FR: "France", GB: "United Kingdom", UK: "United Kingdom", DE: "Germany", BE: "Belgium",
@@ -24,8 +31,7 @@ const COUNTRY_NAMES = {
 
 function slug(s) {
   if (!s) return "";
-  return s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase().replace(/[^a-z\s-]/g, "").trim().split(/\s+/)[0]?.replace(/-/g, "") || "";
+  return s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z\s-]/g, "").trim().split(/\s+/)[0]?.replace(/-/g, "") || "";
 }
 function guessDomains(company) {
   let s = (company || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
@@ -57,15 +63,12 @@ function isJunk(e) { return JUNK.some(j => e.includes(j)); }
 const mxCache = {};
 async function hasMx(domain) {
   if (domain in mxCache) return mxCache[domain];
-  try {
-    const mx = await dns.resolveMx(domain);
-    const ok = Array.isArray(mx) && mx.length > 0;
-    mxCache[domain] = ok; return ok;
-  } catch { mxCache[domain] = false; return false; }
+  try { const mx = await dns.resolveMx(domain); const ok = Array.isArray(mx) && mx.length > 0; mxCache[domain] = ok; return ok; }
+  catch { mxCache[domain] = false; return false; }
 }
-async function fetchText(url, ms, opts) {
+async function fetchText(url, ms, extra) {
   try {
-    const opt = Object.assign({ headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" }, redirect: "follow" }, opts || {});
+    const opt = Object.assign({ headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36", "Accept-Language": "fr,en;q=0.8" }, redirect: "follow" }, extra || {});
     if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(ms);
     const r = await fetch(url, opt);
     if (!r.ok) return "";
@@ -73,60 +76,116 @@ async function fetchText(url, ms, opts) {
   } catch { return ""; }
 }
 
-// ---------- RECHERCHE WEB : Brave (si clé) sinon DuckDuckGo (gratuit) ----------
-async function braveSearch(query, cap, key, debug) {
-  try {
-    const u = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${Math.min(cap * 2, 20)}`;
-    const opt = { headers: { "Accept": "application/json", "X-Subscription-Token": key } };
-    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(7000);
-    const r = await fetch(u, opt);
-    const data = await r.json();
-    if (!data.web || !data.web.results) { debug.push({ brave: data.error?.detail || data.message || ("status " + r.status) }); return []; }
-    const out = [], seen = new Set();
-    for (const it of data.web.results) {
-      let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
-      if (SOCIAL.test(host) || seen.has(host)) continue;
-      seen.add(host);
-      out.push({ company: (it.title || "").split(/[|\-–·:]/)[0].trim() || host, domain: host });
-      if (out.length >= cap) break;
-    }
-    return out;
-  } catch (e) { debug.push({ brave: String(e.message || e) }); return []; }
+// ----------------------- MÉTA-MOTEUR DE RECHERCHE -----------------------
+function decodeHref(href) {
+  href = href.replace(/&amp;/g, "&");
+  const uddg = href.match(/[?&]uddg=([^&]+)/);            // DuckDuckGo
+  if (uddg) { try { return decodeURIComponent(uddg[1]); } catch { return href; } }
+  if (/\/ck\/a/i.test(href) || /[?&]u=a1/.test(href)) {   // Bing (base64 "a1"+url)
+    const m = href.match(/[?&]u=a1([^&]+)/);
+    if (m) { try { let b = m[1].replace(/-/g, "+").replace(/_/g, "/"); while (b.length % 4) b += "="; const dec = Buffer.from(b, "base64").toString("utf8"); if (/^https?:\/\//.test(dec)) return dec; } catch {} }
+  }
+  if (href.startsWith("//")) return "https:" + href;
+  return href;
 }
-
-async function ddgSearch(query, cap, debug) {
+function extractResults(html, cap) {
   const out = [], seen = new Set();
-  try {
-    const u = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const text = await fetchText(u, 7000);
-    if (!text) { debug.push({ ddg: "pas de réponse (peut être bloqué depuis le serveur)" }); return out; }
-    const re = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = re.exec(text)) && out.length < cap) {
-      let href = m[1].replace(/&amp;/g, "&");
-      const title = m[2].replace(/<[^>]+>/g, "").trim();
-      const uddg = href.match(/[?&]uddg=([^&]+)/);
-      let real = uddg ? decodeURIComponent(uddg[1]) : href;
-      if (real.startsWith("//")) real = "https:" + real;
-      let host = ""; try { host = new URL(real).hostname.replace(/^www\./, ""); } catch { continue; }
-      if (SOCIAL.test(host) || seen.has(host)) continue;
-      seen.add(host);
-      out.push({ company: title.split(/[|\-–·:]/)[0].trim() || host, domain: host });
-    }
-    if (!out.length) debug.push({ ddg: "0 résultat extrait" });
-  } catch (e) { debug.push({ ddg: String(e.message || e) }); }
+  const re = /<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]{0,220}?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const href = decodeHref(m[1]);
+    if (!/^https?:\/\//i.test(href)) continue;
+    let host = ""; try { host = new URL(href).hostname.replace(/^www\./, ""); } catch { continue; }
+    if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
+    seen.add(host);
+    const title = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    out.push({ company: (title.split(/[|\-–·:•]/)[0].trim()) || host.split(".")[0], domain: host });
+    if (out.length >= cap) break;
+  }
   return out;
 }
 
-async function webSearch(query, cap, search, debug) {
-  if (search.braveKey) {
-    const b = await braveSearch(query, cap, search.braveKey, debug);
-    if (b.length) return b;
+const HTML_ENGINES = [
+  ["ddg_lite", q => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`],
+  ["ddg_html", q => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`],
+  ["mojeek", q => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}`],
+  ["bing", q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=20&setlang=fr`],
+  ["brave_html", q => `https://search.brave.com/search?q=${encodeURIComponent(q)}`],
+  ["ecosia", q => `https://www.ecosia.org/search?q=${encodeURIComponent(q)}`],
+];
+const FAST_ENGINES = ["ddg_lite", "ddg_html", "mojeek", "bing"];
+const SEARX_INSTANCES = ["https://searx.be", "https://search.sapti.me", "https://priv.au", "https://searx.tiekoetter.com"];
+
+async function htmlEngine(name, urlFn, q, cap, debug, dbgOn) {
+  const html = await fetchText(urlFn(q), 6500);
+  if (!html) { if (dbgOn) debug.push({ [name]: "vide" }); return []; }
+  const res = extractResults(html, cap);
+  if (dbgOn) debug.push({ [name]: res.length });
+  return res;
+}
+async function braveApi(q, cap, key, debug, dbgOn) {
+  try {
+    const u = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${Math.min(cap * 2, 20)}`;
+    const opt = { headers: { "Accept": "application/json", "X-Subscription-Token": key } };
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opt.signal = AbortSignal.timeout(6500);
+    const r = await fetch(u, opt);
+    const data = await r.json();
+    if (!data.web || !data.web.results) { if (dbgOn) debug.push({ brave_api: data.error?.detail || ("status " + r.status) }); return []; }
+    const out = [], seen = new Set();
+    for (const it of data.web.results) {
+      let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
+      if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
+      seen.add(host);
+      out.push({ company: (it.title || "").split(/[|\-–·:•]/)[0].trim() || host.split(".")[0], domain: host });
+      if (out.length >= cap) break;
+    }
+    if (dbgOn) debug.push({ brave_api: out.length });
+    return out;
+  } catch (e) { if (dbgOn) debug.push({ brave_api: String(e.message || e) }); return []; }
+}
+async function searxng(q, cap, debug, dbgOn) {
+  for (const base of SEARX_INSTANCES) {
+    try {
+      const t = await fetchText(`${base}/search?q=${encodeURIComponent(q)}&format=json&language=fr`, 6000);
+      if (!t) continue;
+      const data = JSON.parse(t);
+      const out = [], seen = new Set();
+      for (const it of data.results || []) {
+        let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
+        if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
+        seen.add(host);
+        out.push({ company: (it.title || "").split(/[|\-–·:•]/)[0].trim() || host.split(".")[0], domain: host });
+        if (out.length >= cap) break;
+      }
+      if (out.length) { if (dbgOn) debug.push({ searxng: out.length }); return out; }
+    } catch {}
   }
-  return await ddgSearch(query, cap, debug);
+  if (dbgOn) debug.push({ searxng: 0 });
+  return [];
 }
 
-// ---------- Option A : scraper les emails publiés sur le site ----------
+const searchCache = new Map();
+async function multiSearch(query, cap, search, debug, fast) {
+  const ck = (fast ? "F:" : "M:") + cap + ":" + query;
+  if (searchCache.has(ck)) return searchCache.get(ck);
+  const dbgOn = !fast; // on ne pollue pas le debug pour les recherches par entreprise
+  const tasks = [];
+  if (search.braveKey) tasks.push(braveApi(query, cap, search.braveKey, debug, dbgOn));
+  const engines = fast ? HTML_ENGINES.filter(e => FAST_ENGINES.includes(e[0])) : HTML_ENGINES;
+  for (const [name, urlFn] of engines) tasks.push(htmlEngine(name, urlFn, query, cap, debug, dbgOn));
+  if (!fast) tasks.push(searxng(query, cap, debug, dbgOn));
+  const settled = await Promise.allSettled(tasks);
+  const seen = new Set(), out = [];
+  for (const s of settled) {
+    if (s.status === "fulfilled") for (const r of s.value) {
+      if (!seen.has(r.domain)) { seen.add(r.domain); out.push(r); }
+    }
+  }
+  searchCache.set(ck, out);
+  return out;
+}
+
+// ---------------------------- scraping site ----------------------------
 async function scrapeEmails(domain) {
   const paths = ["", "/contact", "/mentions-legales"];
   const texts = await Promise.all(paths.map(p => fetchText(`https://${domain}${p}`, 4500)));
@@ -146,25 +205,22 @@ async function findDomain(company, search, verifyMx, debug) {
   const guesses = guessDomains(company);
   if (verifyMx) {
     for (const d of guesses) { if (await hasMx(d)) return { domain: d, mxOk: true }; }
-    const res = await webSearch(company, 1, search, debug);
+    const res = await multiSearch(company, 3, search, debug, true);
     if (res[0]) return { domain: res[0].domain, mxOk: await hasMx(res[0].domain) };
     return { domain: "", mxOk: false };
   }
-  const res = await webSearch(company, 1, search, debug);
+  const res = await multiSearch(company, 3, search, debug, true);
   if (res[0]) return { domain: res[0].domain, mxOk: false };
   return { domain: guesses[0] || "", mxOk: false };
 }
 
-// ---------- découverte d'entreprises hors-FR ----------
 async function discoverNonFR(code, keywords, search, doScrape, debug) {
   const name = COUNTRY_NAMES[String(code).toUpperCase()] || code;
-  const found = await webSearch(`${keywords || "ventilation aéraulique HVAC fabricant distributeur"} ${name}`, 10, search, debug);
+  const found = await multiSearch(`${keywords || "ventilation aéraulique HVAC fabricant distributeur"} ${name}`, 15, search, debug, false);
   const out = [];
   await Promise.all(found.map(async ({ company, domain }) => {
     let email = "", statut = "", score = 0;
-    if (doScrape) {
-      try { const scraped = await scrapeEmails(domain); if (scraped.length) { email = scraped[0]; statut = "générique (site)"; score = 45; } } catch {}
-    }
+    if (doScrape) { try { const scraped = await scrapeEmails(domain); if (scraped.length) { email = scraped[0]; statut = "générique (site)"; score = 45; } } catch {} }
     out.push({ prenom: "", nom: "", poste: "", entreprise: company || domain, secteur: keywords || "", pays: name, ville: "", adresse: "", siren: "", domaine: domain, email, email_statut: statut, email_score: score, source: "Web" });
   }));
   return out;
@@ -182,11 +238,10 @@ async function fetchFrancePage({ q, code, page, dept, postal, debug }) {
     const text = await r.text();
     if (!r.ok) { debug.push({ q: code || q, page, status: r.status, body: text.slice(0, 160) }); return null; }
     const data = JSON.parse(text);
-    if (page === 1) debug.push({ q: code || q, status: 200, total: data.total_results, got: (data.results || []).length });
+    if (page === 1) debug.push({ fr: code || q, total: data.total_results, got: (data.results || []).length });
     return data.results || [];
   } catch (e) { debug.push({ q: code || q, page, error: String(e.message || e) }); return null; }
 }
-
 function normalizeFr(it) {
   const siege = it.siege || {};
   const company = it.nom_complet || it.nom_raison_sociale || "";
@@ -219,7 +274,6 @@ async function enrichRow(row, { genEmails, verifyMx, doScrape, search, debug }) 
   if (scraped.length) { row.email = scraped[0]; row.email_statut = "générique (site)"; row.email_score = 45; return; }
   row.email = ""; row.email_statut = ""; row.email_score = 0;
 }
-
 async function enrichBatch(rows, opts) {
   for (let i = 0; i < rows.length; i += ENRICH_CONCURRENCY) {
     await Promise.all(rows.slice(i, i + ENRICH_CONCURRENCY).map(r => enrichRow(r, opts)));
@@ -236,7 +290,6 @@ module.exports = async (req, res) => {
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   body = body || {};
-
   const {
     countries = ["FR"], keywords = "", naf = [], dept = "", postal = "",
     genEmails = true, verifyMx = true, doScrape = true, braveKey = "",
@@ -245,9 +298,7 @@ module.exports = async (req, res) => {
 
   const search = { braveKey };
   const start = Date.now();
-  const debug = [];
-  const notes = [];
-  const rows = [];
+  const debug = [], notes = [], rows = [];
   let batchEmails = 0;
 
   try {
@@ -259,15 +310,14 @@ module.exports = async (req, res) => {
         const disc = await discoverNonFR(c, keywords, search, doScrape, debug);
         rows.push(...disc);
         for (const r of disc) if (r.email) batchEmails++;
-        if (!disc.length) notes.push(`${c} : aucun résultat web (DuckDuckGo a peut-être bloqué le serveur — ajoutez une clé Brave pour fiabiliser).`);
+        if (!disc.length) notes.push(`${c} : aucun résultat web (tous les moteurs ont échoué depuis le serveur — réessayez ou ajoutez une clé Brave).`);
       }
     }
 
     let exhausted = true, nextCursor = null;
     if (wantFR) {
       const queries = keywords ? [{ q: keywords }] : (naf.length ? naf : NAF_DEFAULT).map(code => ({ code }));
-      let qi = cursor?.qi || 0;
-      let page = cursor?.page || 1;
+      let qi = cursor?.qi || 0, page = cursor?.page || 1;
       exhausted = false;
       const seenKeys = new Set();
       while (qi < queries.length) {
@@ -278,10 +328,7 @@ module.exports = async (req, res) => {
         if (items === null || items.length === 0) { qi++; page = 1; continue; }
         let pageRows = [];
         for (const it of items) pageRows.push(...normalizeFr(it));
-        pageRows = pageRows.filter(r => {
-          const k = (r.entreprise + "|" + r.nom + "|" + r.prenom).toLowerCase();
-          if (seenKeys.has(k)) return false; seenKeys.add(k); return true;
-        });
+        pageRows = pageRows.filter(r => { const k = (r.entreprise + "|" + r.nom + "|" + r.prenom).toLowerCase(); if (seenKeys.has(k)) return false; seenKeys.add(k); return true; });
         await enrichBatch(pageRows, { genEmails, verifyMx, doScrape, search, debug });
         for (const r of pageRows) { rows.push(r); if (r.email) batchEmails++; }
         page++;
@@ -290,12 +337,7 @@ module.exports = async (req, res) => {
       if (qi >= queries.length) exhausted = true; else nextCursor = { qi, page };
     }
 
-    rows.sort((a, b) => {
-      const ae = a.email ? 1 : 0, be = b.email ? 1 : 0;
-      if (ae !== be) return be - ae;
-      return (b.email_score || 0) - (a.email_score || 0);
-    });
-
+    rows.sort((a, b) => { const ae = a.email ? 1 : 0, be = b.email ? 1 : 0; if (ae !== be) return be - ae; return (b.email_score || 0) - (a.email_score || 0); });
     res.status(200).json({ count: rows.length, withEmail: batchEmails, results: rows, cursor: nextCursor, exhausted, notes, _debug: debug });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
