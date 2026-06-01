@@ -14,11 +14,13 @@ const JUNK = ["example.", "sentry", "wixpress", ".png", ".jpg", ".jpeg", ".gif",
   "your-email", "yourname", "yourdomain", "domain.com", "email@", "u003e", "@2x", "name@", "nom@"];
 const SOCIAL = /linkedin|facebook|fb\.com|youtube|youtu\.be|wikipedia|twitter|x\.com|instagram|pinterest|tiktok|snapchat/i;
 const SKIP_HOSTS = ["bing.com", "microsoft.com", "msn.com", "duckduckgo.com", "mojeek.com", "ecosia.org",
-  "brave.com", "google.", "gstatic.com", "googleapis.com", "cloudflare", "jsdelivr", "unpkg", "w3.org",
-  "schema.org", "gmpg.org", "gravatar.com", "fonts.", "akamai", "fbcdn", "ytimg", "doubleclick", "paypal.com",
-  "cookielaw.org", "onetrust.com", "searx", "startpage.com", "qwant.com", "yahoo.com", "yandex",
-  "societe.com", "verif.com", "infogreffe", "pappers", "pagesjaunes", "annuaire", "indeed", "glassdoor",
-  "mappy", "yelp", "tripadvisor", "amazon.", "ebay.", "archive.org", "wikimedia"];
+  "brave.com", "brave.app", "hackerone", "bugcrowd", "google.", "gstatic.com", "googleapis.com", "cloudflare",
+  "jsdelivr", "unpkg", "w3.org", "schema.org", "gmpg.org", "gravatar.com", "fonts.", "akamai", "fbcdn", "ytimg",
+  "doubleclick", "paypal.com", "cookielaw.org", "onetrust.com", "searx", "startpage.com", "qwant.com",
+  "yahoo.com", "yandex", "mozilla", "apple.com", "github.", "gitlab", "stackoverflow", "reddit", "quora",
+  "medium.com", "trustpilot", "crunchbase", "bloomberg", "kompass", "europages", "societe.com", "verif.com",
+  "infogreffe", "pappers", "pagesjaunes", "annuaire", "indeed", "glassdoor", "mappy", "yelp", "tripadvisor",
+  "amazon.", "ebay.", "archive.org", "wikimedia"];
 function isSkipHost(h) { return SKIP_HOSTS.some(s => h.includes(s)); }
 
 const COUNTRY_NAMES = {
@@ -77,50 +79,93 @@ async function fetchText(url, ms, extra) {
 }
 
 // ----------------------- MÉTA-MOTEUR DE RECHERCHE -----------------------
-function decodeHref(href) {
-  href = href.replace(/&amp;/g, "&");
-  const uddg = href.match(/[?&]uddg=([^&]+)/);            // DuckDuckGo
-  if (uddg) { try { return decodeURIComponent(uddg[1]); } catch { return href; } }
-  if (/\/ck\/a/i.test(href) || /[?&]u=a1/.test(href)) {   // Bing (base64 "a1"+url)
-    const m = href.match(/[?&]u=a1([^&]+)/);
-    if (m) { try { let b = m[1].replace(/-/g, "+").replace(/_/g, "/"); while (b.length % 4) b += "="; const dec = Buffer.from(b, "base64").toString("utf8"); if (/^https?:\/\//.test(dec)) return dec; } catch {} }
-  }
-  if (href.startsWith("//")) return "https:" + href;
+// Extracteurs PRÉCIS par moteur : on ne lit que les vrais blocs de résultats,
+// jamais les liens de navigation/footer. Uniquement des moteurs SANS JavaScript.
+
+const BAD_SUBDOMAIN = /^(status|help|support|docs?|blog|api|cdn|mail|webmail|login|account|developer|dev|kb|wiki|forum|community|shop|store|m)\./i;
+
+function hostOf(url) {
+  try {
+    if (url.startsWith("//")) url = "https:" + url;
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch { return ""; }
+}
+function badHost(h) {
+  return !h || SOCIAL.test(h) || isSkipHost(h) || BAD_SUBDOMAIN.test(h);
+}
+function companyFromHost(h) { return (h.split(".")[0] || h).replace(/-/g, " "); }
+function bingDecode(href) {
+  const m = href.match(/[?&]u=a1([^&]+)/);
+  if (m) { try { let b = m[1].replace(/-/g, "+").replace(/_/g, "/"); while (b.length % 4) b += "="; const d = Buffer.from(b, "base64").toString("utf8"); if (/^https?:\/\//.test(d)) return d; } catch {} }
   return href;
 }
-function extractResults(html, cap) {
+function cleanTitle(t, host) { return (t || "").replace(/<[^>]+>/g, "").replace(/&[a-z]+;/g, " ").replace(/\s+/g, " ").trim().split(/[|\-–·:•]/)[0].trim() || companyFromHost(host); }
+
+// DuckDuckGo (html + lite) : les vrais résultats sont les liens "uddg="
+function ddgParse(html, cap) {
   const out = [], seen = new Set();
-  const re = /<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]{0,220}?)<\/a>/gi;
+  const re = /<a\b(?=[^>]*(?:result__a|result-link))[^>]*?href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let m;
-  while ((m = re.exec(html))) {
-    const href = decodeHref(m[1]);
-    if (!/^https?:\/\//i.test(href)) continue;
-    let host = ""; try { host = new URL(href).hostname.replace(/^www\./, ""); } catch { continue; }
-    if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
-    seen.add(host);
-    const title = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-    out.push({ company: (title.split(/[|\-–·:•]/)[0].trim()) || host.split(".")[0], domain: host });
-    if (out.length >= cap) break;
+  while ((m = re.exec(html)) && out.length < cap) {
+    let href = m[1].replace(/&amp;/g, "&");
+    const u = href.match(/[?&]uddg=([^&]+)/);
+    if (u) { try { href = decodeURIComponent(u[1]); } catch {} }
+    const host = hostOf(href);
+    if (badHost(host) || seen.has(host)) continue;
+    seen.add(host); out.push({ company: cleanTitle(m[2], host), domain: host });
+  }
+  if (!out.length) { // fallback : tous les liens uddg même sans classe (lite minimal)
+    const re2 = /[?&]uddg=([^&"']+)/g; let m2;
+    while ((m2 = re2.exec(html)) && out.length < cap) {
+      let real; try { real = decodeURIComponent(m2[1]); } catch { continue; }
+      const host = hostOf(real); if (badHost(host) || seen.has(host)) continue;
+      seen.add(host); out.push({ company: companyFromHost(host), domain: host });
+    }
+  }
+  return out;
+}
+// Bing : résultats dans <h2><a href> (souvent redirection base64 ck/a)
+function bingParse(html, cap) {
+  const out = [], seen = new Set();
+  const re = /<h2>\s*<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) && out.length < cap) {
+    const href = bingDecode(m[1].replace(/&amp;/g, "&"));
+    const host = hostOf(href);
+    if (badHost(host) || seen.has(host)) continue;
+    seen.add(host); out.push({ company: cleanTitle(m[2], host), domain: host });
+  }
+  return out;
+}
+// Mojeek : on scope au conteneur de résultats puis on prend les liens externes
+function mojeekParse(html, cap) {
+  const out = [], seen = new Set();
+  const mc = html.match(/<ul[^>]*results-standard[\s\S]*?<\/ul>/i);
+  const scope = mc ? mc[0] : html;
+  const re = /<a\b[^>]*href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(scope)) && out.length < cap) {
+    const host = hostOf(m[1].replace(/&amp;/g, "&"));
+    if (badHost(host) || seen.has(host)) continue;
+    seen.add(host); out.push({ company: cleanTitle(m[2], host), domain: host });
   }
   return out;
 }
 
-const HTML_ENGINES = [
-  ["ddg_lite", q => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`],
-  ["ddg_html", q => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`],
-  ["mojeek", q => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}`],
-  ["bing", q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=20&setlang=fr`],
-  ["brave_html", q => `https://search.brave.com/search?q=${encodeURIComponent(q)}`],
-  ["ecosia", q => `https://www.ecosia.org/search?q=${encodeURIComponent(q)}`],
+const ENGINES = [
+  { name: "ddg_lite", url: q => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`, parse: ddgParse },
+  { name: "ddg_html", url: q => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`, parse: ddgParse },
+  { name: "bing", url: q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=20&setlang=fr`, parse: bingParse },
+  { name: "mojeek", url: q => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}`, parse: mojeekParse },
 ];
-const FAST_ENGINES = ["ddg_lite", "ddg_html", "mojeek", "bing"];
+const FAST_ENGINES = ["ddg_lite", "ddg_html", "bing", "mojeek"];
 const SEARX_INSTANCES = ["https://searx.be", "https://search.sapti.me", "https://priv.au", "https://searx.tiekoetter.com"];
 
-async function htmlEngine(name, urlFn, q, cap, debug, dbgOn) {
-  const html = await fetchText(urlFn(q), 6500);
-  if (!html) { if (dbgOn) debug.push({ [name]: "vide" }); return []; }
-  const res = extractResults(html, cap);
-  if (dbgOn) debug.push({ [name]: res.length });
+async function runEngine(eng, q, cap, debug, dbgOn) {
+  const html = await fetchText(eng.url(q), 6500);
+  if (!html) { if (dbgOn) debug.push({ [eng.name]: "vide/bloqué" }); return []; }
+  const res = eng.parse(html, cap);
+  if (dbgOn) debug.push({ [eng.name]: res.length });
   return res;
 }
 async function braveApi(q, cap, key, debug, dbgOn) {
@@ -133,10 +178,9 @@ async function braveApi(q, cap, key, debug, dbgOn) {
     if (!data.web || !data.web.results) { if (dbgOn) debug.push({ brave_api: data.error?.detail || ("status " + r.status) }); return []; }
     const out = [], seen = new Set();
     for (const it of data.web.results) {
-      let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
-      if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
-      seen.add(host);
-      out.push({ company: (it.title || "").split(/[|\-–·:•]/)[0].trim() || host.split(".")[0], domain: host });
+      const host = hostOf(it.url);
+      if (badHost(host) || seen.has(host)) continue;
+      seen.add(host); out.push({ company: cleanTitle(it.title, host), domain: host });
       if (out.length >= cap) break;
     }
     if (dbgOn) debug.push({ brave_api: out.length });
@@ -151,10 +195,9 @@ async function searxng(q, cap, debug, dbgOn) {
       const data = JSON.parse(t);
       const out = [], seen = new Set();
       for (const it of data.results || []) {
-        let host = ""; try { host = new URL(it.url).hostname.replace(/^www\./, ""); } catch { continue; }
-        if (seen.has(host) || SOCIAL.test(host) || isSkipHost(host)) continue;
-        seen.add(host);
-        out.push({ company: (it.title || "").split(/[|\-–·:•]/)[0].trim() || host.split(".")[0], domain: host });
+        const host = hostOf(it.url);
+        if (badHost(host) || seen.has(host)) continue;
+        seen.add(host); out.push({ company: cleanTitle(it.title, host), domain: host });
         if (out.length >= cap) break;
       }
       if (out.length) { if (dbgOn) debug.push({ searxng: out.length }); return out; }
@@ -168,18 +211,16 @@ const searchCache = new Map();
 async function multiSearch(query, cap, search, debug, fast) {
   const ck = (fast ? "F:" : "M:") + cap + ":" + query;
   if (searchCache.has(ck)) return searchCache.get(ck);
-  const dbgOn = !fast; // on ne pollue pas le debug pour les recherches par entreprise
+  const dbgOn = !fast;
   const tasks = [];
   if (search.braveKey) tasks.push(braveApi(query, cap, search.braveKey, debug, dbgOn));
-  const engines = fast ? HTML_ENGINES.filter(e => FAST_ENGINES.includes(e[0])) : HTML_ENGINES;
-  for (const [name, urlFn] of engines) tasks.push(htmlEngine(name, urlFn, query, cap, debug, dbgOn));
+  const engines = fast ? ENGINES.filter(e => FAST_ENGINES.includes(e.name)) : ENGINES;
+  for (const eng of engines) tasks.push(runEngine(eng, query, cap, debug, dbgOn));
   if (!fast) tasks.push(searxng(query, cap, debug, dbgOn));
   const settled = await Promise.allSettled(tasks);
   const seen = new Set(), out = [];
-  for (const s of settled) {
-    if (s.status === "fulfilled") for (const r of s.value) {
-      if (!seen.has(r.domain)) { seen.add(r.domain); out.push(r); }
-    }
+  for (const s of settled) if (s.status === "fulfilled") for (const r of s.value) {
+    if (!seen.has(r.domain)) { seen.add(r.domain); out.push(r); }
   }
   searchCache.set(ck, out);
   return out;
